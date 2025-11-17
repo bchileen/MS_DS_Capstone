@@ -7,7 +7,8 @@ output: html_document
 ###Load in CSAT Data
 ```{r, evaluate = FALSE, include=FALSE}
 ### Shoaling Rates
-
+# Set folder path
+csat_path <- "C:/workspace/CSAT/CSAT_distribution/output/CEMVR/19990101__to__20241231"
 files <-list.files(path = csat_path,
                                  pattern = "_SurveyPairVolumeDifference\\.csv$",
                                  full.names = TRUE)
