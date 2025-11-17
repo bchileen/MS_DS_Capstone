@@ -1,0 +1,2192 @@
+---
+title: "Capstone"
+output: html_document
+date: "2025-10-17"
+---
+
+## Load Necessary Packages
+```{r, message = FALSE}
+library(readr)
+library(tidyverse)
+library(lubridate)
+library(ggfortify)
+library(ggformula)
+library(DiagrammeR)
+library(gridExtra)
+library(keras3)
+library(patchwork)
+library(zoo)
+library(forecast)
+
+# Core data manipulation and visualization
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(kableExtra)
+
+# Machine learning frameworks
+library(caret)
+library(xgboost)
+library(randomForest)
+
+# Time series and deep learning
+library(keras3)
+library(tensorflow)
+library(torch)
+library(timetk)
+library(recipes)
+
+# Statistical analysis
+library(corrplot)
+library(VIM)
+library(Hmisc)
+
+# Model performance and visualization
+library(plotly)
+library(viridis)
+library(patchwork)
+
+# Parallel processing
+library(doParallel)
+library(foreach)
+
+# Set up parallel processing
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+cat("Libraries loaded successfully\n")
+cat("Parallel processing set up with", detectCores() - 1, "cores\n")
+
+```
+
+### Read In the data
+```{r}
+### Load in the three datasets
+#### Gage data is downloaded through the RiverGages.com api
+gage_data<-read_csv("UMR_IWW_1999_2024.csv", show_col_types = FALSE)
+#### CSAT data is output from the Corps Shoaling Analysis Tool for Rock Island 
+#### District (MVR)
+CSAT_data <- read_csv("CSAT_DATA_Combined.csv", show_col_types = FALSE)
+#### The gage metadata contains spatial information about the river gages
+gage_metadata <- read_csv("gage_metadata.csv", show_col_types = FALSE)
+
+### LEts take a brief look at the data
+glimpse(gage_data)
+glimpse(CSAT_data)
+glimpse(gage_metadata)
+
+
+# Now run some quick summary statistics
+cat("Gage data date range:", min(gage_data$Date, na.rm = TRUE), "to", 
+    max(gage_data$Date, na.rm = TRUE), "\n")
+cat("CSAT data surveys:", nrow(CSAT_data), "survey pairs\n")
+cat("Shoaling rate range:", round(min(CSAT_data$AnnualShoalingRate_ftperyr, 
+                                      na.rm = TRUE), 3), 
+    "to", round(max(CSAT_data$AnnualShoalingRate_ftperyr, na.rm = TRUE), 3), 
+    "ft/yr\n")
+
+### Lets also filter out the gages by river to have on hand if we need to split
+### the data
+IWW_gages <- gage_metadata |>
+  filter(River == "IWW")|>
+  pull(Gage_ID)
+
+Miss_gages <- gage_metadata |>
+  filter(River == "Miss")|>
+  pull(Gage_ID)
+
+
+```
+### Clean Gage Data
+```{r}
+### All dates need to be made into a date object and lets create a variable for
+### season of the year and factor it. The final step is to remove any rows with 
+### an empty date since we wont be able to join them to the CSAT data
+ gage_data_cleaned <- gage_data |>
+    mutate(
+      Date = dmy(Date),
+      Year = year(Date),
+      Month = month(Date),
+      Day = yday(Date),
+      WeekOfYear = week(Date),
+      Season = case_when(
+        Month %in% c(12, 1, 2) ~ "Winter",
+        Month %in% c(3, 4, 5) ~ "Spring", 
+        Month %in% c(6, 7, 8) ~ "Summer",
+        Month %in% c(9, 10, 11) ~ "Fall"
+      ),
+      Season = factor(Season, levels = c("Winter", "Spring", "Summer", "Fall"))
+    ) |>
+    filter(!is.na(Date)) |>
+    arrange(Date)
+
+### Now lets take a look at NA counts 
+na_counts <- colSums(is.na(gage_data_cleaned))
+names<-names(gage_data_cleaned)
+# Create a data frame for the table
+na_table <- data.frame(
+  Gage_Name = names,
+  NA_Count = na_counts
+)|>
+  filter(NA_Count >=1)
+
+### Thats not too bad, lets try interpolating some dates. Lets use a gap of 4 
+### days which is reasonable for river gage forecasts
+gage_data <- gage_data_cleaned |>
+arrange(Date) |>
+mutate(across(
+  where(is.numeric) & !matches("Date"),
+  ~ na.approx(., x = Date, maxgap = 4, na.rm = FALSE)
+))
+
+gage_cols <- setdiff(names(gage_data_cleaned), c("Date", "Year", "Month", "Day", "WeekOfYear", "Season"))
+
+# Apply interpolation to each gage column
+gage_data_interpolated <- gage_data_cleaned |>
+  mutate(across(all_of(gage_cols), ~ {
+    # Use na.approx with maxgap parameter
+    # maxgap = 4 means only interpolate if gap is 4 days or less
+    na.approx(.x, x = Date, maxgap = 4, na.rm = FALSE)
+  }))
+
+### Print the missing values pre and post interpolation
+cat("Missing values before interpolation:", sum(is.na(gage_data_cleaned[,-c(1,62:66)])), "\n")
+cat("Missing values after interpolation:", sum(is.na(gage_data_interpolated[,-c(1,62:66)])), "\n")
+  
+```
+
+### Clean CSAT Data
+```{r}
+### All dates need to be made into a date object and lets create a variable for
+### season of the year and factor it. Add additional fields for days between 
+### surveys as well as a reliability indicator. Filter empty shoaling rates and
+### make sure that the shoaling rate is <30 and the days between are within 1 year
+ CSAT_data_cleaned <- CSAT_data |>
+    mutate(
+      SurveyDateBefore = ymd(as.character(SurveyDateBefore)),
+      SurveyDateAfter = ymd(as.character(SurveyDateAfter)),
+      DaysBetween = as.numeric(SurveyDateAfter - SurveyDateBefore),
+      SurveyYear = year(SurveyDateAfter),
+      SurveyMonth = month(SurveyDateAfter),
+      SurveyWeekOfYear = week(SurveyDateAfter),
+      SurveySeason = case_when(
+        SurveyMonth %in% c(12, 1, 2) ~ "Winter",
+        SurveyMonth %in% c(3, 4, 5) ~ "Spring",
+        SurveyMonth %in% c(6, 7, 8) ~ "Summer", 
+        SurveyMonth %in% c(9, 10, 11) ~ "Fall"
+      ),
+      SurveySeason = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+      rate_reliability = case_when(DaysBetween <= 30 ~ 1.0,
+  DaysBetween <= 60 ~ 0.8,  # High quality
+  DaysBetween <= 180 ~ 0.6,  # Medium quality  
+  DaysBetween <= 240 ~ 0.4,  # Low quality
+  TRUE ~ 0.2  # Very low quality
+)
+    ) |>
+    filter(!is.na(AnnualShoalingRate_ftperyr), !is.infinite(AnnualShoalingRate_ftperyr),
+           abs(AnnualShoalingRate_ftperyr)<= 30, 
+           DaysBetween <= 365)
+
+### Lets look at the distribution of the rates
+histogram(CSAT_data_cleaned$rate_reliability)
+
+```
+
+### Check Missing Values
+```{r}
+gage_missing <- gage_data_interpolated |>
+  select(-Date, -Year, -Month, -Day, -WeekOfYear, -Season) |>
+  summarise_all(~sum(is.na(.))) |>
+  gather(variable, missing_count) |>
+  mutate(missing_percent = round(missing_count / nrow(gage_data) * 100, 2)) |>
+  arrange(desc(missing_percent))
+
+print(kable(head(gage_missing, 10), caption = "Top 10 Variables with Missing Data"))
+
+cat("Missing shoaling rates:", sum(is.na(CSAT_data$AnnualShoalingRate_ftperyr)), "\n")
+cat("Infinite shoaling rates:", sum(is.infinite(CSAT_data$AnnualShoalingRate_ftperyr)), "\n")
+cat("Zero shoaling rates:", sum(CSAT_data$AnnualShoalingRate_ftperyr == 0, na.rm = TRUE), "\n")
+
+```
+###Join the data
+```{r}
+### Now join the data using the SurveyDateAfter since that represents when the 
+### shoaling was valid. 
+gage_CSAT_joined <- CSAT_data_cleaned |>
+  left_join(gage_data_interpolated, by =c("SurveyDateAfter" = "Date"))|>
+  select(-SurveyYear,-SurveyMonth,-SurveyWeekOfYear)
+
+### Lets make counts of the number of records within each pool
+counts<-gage_CSAT_joined |>
+  group_by(pool)|>
+  summarise(count = n())
+
+### Based on those results, lets filter out AL, LP, BR, CS, and Pool 24
+gage_CSAT_joined <- gage_CSAT_joined|>
+   filter(!pool %in% c("AL","LP","BR","CS","24"))
+
+### Lets do another check for NAs in the data
+gage_CSAT_missing <- gage_CSAT_joined |>
+  select(-SurveyDateAfter,-SurveyDateBefore, -Year, -Month, -Day, -WeekOfYear, -Season) |>
+  summarise_all(~sum(is.na(.))) |>
+  gather(variable, missing_count) |>
+  mutate(missing_percent = round(missing_count / nrow(gage_CSAT_joined) * 100, 2)) |>
+  arrange(desc(missing_percent))
+  
+
+cat("Total observations:", nrow(gage_CSAT_joined), "\n")
+cat("Date range:", min(gage_CSAT_joined$SurveyDateAfter), "to", 
+    max(gage_CSAT_joined$SurveyDateAfter), "\n\n")
+
+```
+### Distribution Plots
+```{r}
+### Lets make a series of plots to view the distribution of the data
+target_plots <- list()
+
+# 1. Distribution
+target_plots$dist <- gage_CSAT_joined |>
+  ggplot(aes(x =  AnnualShoalingRate_ftperyr)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7) +
+  geom_vline(aes(xintercept = median( AnnualShoalingRate_ftperyr, na.rm = TRUE)), 
+             color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Distribution of  AnnualShoalingRate_ftperyr",
+       x = " AnnualShoalingRate_ftperyr",
+       y = "Frequency") +
+  theme_minimal()
+
+# 2. Time series
+target_plots$ts <- gage_CSAT_joined |>
+  ggplot(aes(x = SurveyDateAfter, y = AnnualShoalingRate_ftperyr)) +
+  geom_line(alpha = 0.6, color = "darkblue") +
+  geom_smooth(method = "loess", span = 0.3, se = FALSE, color = "red", size = 1) +
+  facet_wrap(~river, scales = "free_y") +
+  labs(title = "Shoaling Rate Time Series by River",
+       x = "Date", y = "7-Day Average Shoaling Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 3. Seasonal patterns
+target_plots$seasonal <- gage_CSAT_joined |>
+  group_by(Month, river) %>%
+  summarise(avg_shoaling = mean(AnnualShoalingRate_ftperyr, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = Month, y = avg_shoaling, color = river)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  labs(title = "Seasonal Shoaling Patterns",
+       x = "Month", y = "Average Shoaling Rate",
+       color = "River") +
+  theme_minimal()
+
+# Display plots
+grid.arrange(target_plots$dist, target_plots$seasonal, ncol = 1)
+target_plots$ts
+
+ggplot(gage_CSAT_joined,aes(x = SurveyDateAfter, y = AnnualShoalingRate_ftperyr))+
+         geom_line()+ 
+  facet_wrap(~pool)
+```
+
+
+### Correlation Matrix
+```{r}
+cor_matrix<-gage_CSAT_joined|>
+  select(where(is.numeric),-AnnualShoalingRate_ftperyr)|>
+  cor(use = "pairwise.complete.obs")
+cor_matrix
+
+high_cor_pairs<- function(cor_mat, threshold = 0.9){
+  cor_mat[lower.tri(cor_mat)] <- NA
+  diag(cor_mat) <- NA
+
+  high_cor <- which(abs(cor_mat) > threshold, arr.ind=TRUE)
+  if (nrow(high_cor) > 0) {
+    data.frame(
+      var1 = rownames(cor_mat)[high_cor[,1]],
+      var2 = rownames(cor_mat)[high_cor[,2]],
+      correlation = cor_mat[high_cor]) |>
+      arrange(desc(abs(correlation)))
+} else {
+  data.frame()
+}
+}
+
+
+high_cors<-high_cor_pairs(cor_matrix, 0.9)
+
+filtered_cors<- high_cors |>
+  filter(var1 != var2)
+
+library(corrplot)
+corrplot(cor_matrix, tl.cex = 0.5, type = "upper")
+```
+
+### Create Temporal Splits
+```{r}
+create_temporal_splits <- function(data, train_prop = 0.70, val_prop = 0.15) {
+
+# Ensure data is sorted by date
+  data <- data |> 
+    arrange(SurveyDateAfter)
+  
+  n <- nrow(data)
+  train_end <- floor(n * train_prop)
+  val_end <- floor(n * (train_prop + val_prop))
+  
+  splits <- list(
+    train_idx = 1:train_end,
+    val_idx = (train_end + 1):val_end,
+    test_idx = (val_end + 1):n,
+    
+    train_dates = data$SurveyDateAfter[1:train_end],
+    val_dates = data$SurveyDateAfter[(train_end + 1):val_end],
+    test_dates = data$SurveyDateAfter[(val_end + 1):n]
+  )
+  
+  cat(sprintf("Temporal splits created:\n"))
+  cat(sprintf("  Training: %d samples (%.1f%%) - %s to %s\n", 
+              length(splits$train_idx), train_prop*100,
+              min(splits$train_dates), max(splits$train_dates)))
+  cat(sprintf("  Validation: %d samples (%.1f%%) - %s to %s\n", 
+              length(splits$val_idx), val_prop*100,
+              min(splits$val_dates), max(splits$val_dates)))
+  cat(sprintf("  Test: %d samples (%.1f%%) - %s to %s\n", 
+              length(splits$test_idx), (1-train_prop-val_prop)*100,
+              min(splits$test_dates), max(splits$test_dates)))
+  
+  return(splits)
+}
+
+IWW_data <- gage_CSAT_joined |>
+   filter(river == "IL")
+Miss_data <- gage_CSAT_joined |>
+  filter(river == "UM")
+
+cat("\n=== CREATING TEMPORAL SPLITS ===\n")
+cat("\nIllinois Waterway:\n")
+IWW_splits <- create_temporal_splits(IWW_data)
+
+cat("\nMississippi River:\n")
+Miss_splits <- create_temporal_splits(Miss_data)
+
+cat("\nCombined Rivers:\n")
+Combined_splits <- create_temporal_splits(gage_CSAT_joined)
+
+```
+### Baseline Model 
+```{r}
+create_time_series_baselines <- function(data, splits, dataset_name) {
+
+  cat(sprintf("=== %s BASELINES ===\n", dataset_name))
+  
+  # Prepare training data
+  train_data <- data[splits$train_idx, ]
+  val_data <- data[splits$val_idx, ]
+  test_data <- data[splits$test_idx, ]
+  
+  # Baseline 1: Persistence (Naive Forecast)
+  # Prediction = last observed value
+  persistence_pred_test <- c(tail(train_data$AnnualShoalingRate_ftperyr, 1),
+                             test_data$AnnualShoalingRate_ftperyr[-nrow(test_data)])
+  persistence_rmse <- sqrt(mean((persistence_pred_test - test_data$AnnualShoalingRate_ftperyr)^2))
+  persistence_mae <- mean(abs(persistence_pred_test - test_data$AnnualShoalingRate_ftperyr))
+  
+  # Baseline 2: Mean Forecast
+  # Always predict the training mean
+  mean_pred <- mean(train_data$AnnualShoalingRate_ftperyr, na.rm = TRUE)
+  mean_pred_test <- rep(mean_pred, nrow(test_data))
+  mean_rmse <- sqrt(mean((mean_pred_test - test_data$AnnualShoalingRate_ftperyr)^2))
+  mean_mae <- mean(abs(mean_pred_test - test_data$AnnualShoalingRate_ftperyr))
+  
+  # Baseline 3: ARIMA (Following Asborno et al. 2023 methodology)
+  cat("  Training ARIMA model...\n")
+  
+  # Create time series object
+  train_ts <- ts(train_data$AnnualShoalingRate_ftperyr, frequency = 12)
+  
+  # Fit ARIMA with auto.arima (finds best parameters)
+  arima_model <- auto.arima(train_ts, 
+                           seasonal = TRUE,
+                           stepwise = TRUE,
+                           approximation = FALSE,
+                           trace = FALSE)
+  
+  cat(sprintf("  ARIMA model selected: %s\n", paste(arimaorder(arima_model), collapse=",")))
+  
+  # Forecast on test set
+  arima_forecast <- forecast(arima_model, h = nrow(test_data))
+  arima_pred_test <- as.numeric(arima_forecast$mean)
+  arima_rmse <- sqrt(mean((arima_pred_test - test_data$AnnualShoalingRate_ftperyr)^2))
+  arima_mae <- mean(abs(arima_pred_test - test_data$AnnualShoalingRate_ftperyr))
+  
+  # Compile results
+  baseline_results <- data.frame(
+    Model = c("Persistence", "Mean", "ARIMA"),
+    Test_RMSE = c(persistence_rmse, mean_rmse, arima_rmse),
+    Test_MAE = c(persistence_mae, mean_mae, arima_mae),
+    Dataset = dataset_name
+  ) %>%
+    arrange(Test_RMSE)
+  
+  cat("\nBaseline Performance:\n")
+  print(baseline_results)
+  cat("\n")
+  
+  return(list(
+    results = baseline_results,
+    arima_model = arima_model,
+    predictions = data.frame(
+      actual = test_data$AnnualShoalingRate_ftperyr,
+      persistence = persistence_pred_test,
+      mean = mean_pred_test,
+      arima = arima_pred_test,
+      date = test_data$SurveyDateAfter
+    )
+  ))
+}
+
+# Create baselines for each dataset
+IWW_baselines <- create_time_series_baselines(IWW_data, IWW_splits, "Illinois Waterway")
+Miss_baselines <- create_time_series_baselines(Miss_data, Miss_splits, "Mississippi River")
+Combined_baselines <- create_time_series_baselines(gage_CSAT_joined, Combined_splits, "Combined")
+
+IWW_baselines$results
+Miss_baselines$results
+Combined_baselines$results
+```
+
+
+
+### Combined PCA
+```{r}
+colSums(is.na(gage_CSAT_joined))
+
+ gage_survey_PCA <- gage_CSAT_joined |>
+ select(where(is.numeric), -Year, -Month, -Day,-WeekOfYear, -SurveyDateBefore,-SurveyDateAfter,
+        -rate_reliability,-reach, -NetVolumeChange_CY, -AnnualShoalingVolume_CYperyr, -AnnualShoalingRate_ftperyr, -SurveyOverlapArea_sqft, -SurveyOverlapPctReach)
+
+na_summary <- gage_survey_PCA |>
+  summarise_all(~sum(is.na(.))) |>
+  gather(variable, missing_count) |>
+  mutate(missing_percent = round(missing_count / nrow(gage_survey_PCA) * 100, 2)) |>
+  arrange(desc(missing_percent))
+
+cat("Missing values summary (top 10):\n")
+print(head(na_summary, 10))
+
+# Remove rows with any missing values for PCA (listwise deletion)
+pca_data_complete <- gage_survey_PCA |>
+  drop_na()
+
+cat("Complete cases for PCA:", nrow(pca_data_complete), "out of", nrow(gage_CSAT_joined), "\n")
+ 
+visualization_data <- gage_CSAT_joined |>
+  slice(as.numeric(rownames(pca_data_complete))) |>  # Match rows used in PCA
+  select(SurveyDateAfter, SurveySeason, Day, Month, WeekOfYear,
+         river, pool) |>
+  mutate(
+    season = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+    river_system = factor(river),
+    pool_name = factor(pool),
+    week_of_year = WeekOfYear)
+  
+
+Combined_PCA = prcomp(pca_data_complete, scale = T, center = T)
+ 
+plot(Combined_PCA,  type="l")
+ 
+a<-autoplot(Combined_PCA,data = visualization_data, 
+         color = 'season',loadings = TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+  ggtitle("Season")
+
+b<-autoplot(Combined_PCA,data = visualization_data,
+         color = 'pool',loadings= TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+  ggtitle("River Pool")+
+    guides(color = guide_legend(ncol = 3))
+
+
+c<-autoplot(Combined_PCA,data = visualization_data,
+         color = 'river',loadings = TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+  ggtitle("River")
+
+
+d<-autoplot(Combined_PCA,data = visualization_data,
+         color = 'week_of_year',loadings = TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+        ggtitle("Week ")+
+  labs(color = "Week of Year?")
+
+library(patchwork)
+combined <- a + b + c + d + plot_layout(ncol = 2, nrow = 2)
+
+ggsave("./PCA_Output/Initial_Full_PCA.png", combined, width = 21, height = 6)
+variable_contributions<- Combined_PCA$rotation
+head(variable_contributions)
+```
+
+### IWW PCA
+```{r}
+
+IWW_gages <- gage_metadata |>
+  filter(River == "IWW")|>
+  pull(Gage_ID)
+
+ IWW_PCA <- gage_CSAT_joined |>
+  filter(river == "IL")|>
+ select(where(is.numeric), -Year, -Month, -Day,-WeekOfYear, -SurveyDateBefore,-SurveyDateAfter,
+        -rate_reliability,-reach)|>
+   select(any_of(IWW_gages))
+
+IWW_PCA_Complete <- IWW_PCA |>
+  drop_na()
+
+IWW_Viz <- gage_CSAT_joined |>
+  slice(as.numeric(rownames(IWW_PCA_Complete))) |>  # Match rows used in PCA
+  select(SurveyDateAfter, SurveySeason, Day, Month, WeekOfYear,
+         river, pool) |>
+  mutate(
+    season = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+    river_system = factor(river),
+    pool_name = factor(pool),
+    week_of_year = WeekOfYear)
+
+IWW_PCA = prcomp(IWW_PCA_Complete, scale = T, center = T)
+ 
+plot(IWW_PCA,  type="l")
+ 
+a<-autoplot(IWW_PCA,data = IWW_Viz, 
+         color = 'season',loadings = TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+  ggtitle("Season")
+
+b<-autoplot(IWW_PCA,data = IWW_Viz,
+         color = 'pool',loadings= TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+  ggtitle("River Pool")+
+    guides(color = guide_legend(ncol = 3))
+
+
+c<-autoplot(IWW_PCA,data = IWW_Viz,
+         color = 'week_of_year',loadings = TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+        ggtitle("Week ")+
+  labs(color = "Week of Year?")
+
+library(patchwork)
+combined <- a + b + c + plot_layout(ncol = 3)
+
+ggsave("./PCA_Output/Initial_Full_PCA_IWW.png", combined, width = 21, height = 6)
+variable_contributions<- IWW_PCA$rotation
+head(variable_contributions)
+
+IWW_explained_variance <- summary(IWW_PCA)$importance[2, ] * 100
+IWW_cumulative_variance <- summary(IWW_PCA)$importance[3, ] * 100
+
+# Determine number of components to retain
+IWW_eigenvalues <- (IWW_PCA$sdev)^2
+IWW_components_to_retain <- sum(IWW_eigenvalues > 1)
+
+cat("Variance explained by first 5 PCs:", round(IWW_explained_variance[1:5], 2), "%\n")
+cat("Components with eigenvalues > 1:", IWW_components_to_retain, "\n")
+
+```
+
+
+### Miss PCA
+```{r}
+Miss_gages <- gage_metadata |>
+  filter(River == "Miss")|>
+  pull(Gage_ID)
+
+ Miss_PCA <- gage_CSAT_joined |>
+  filter(river == "UM")|>
+ select(where(is.numeric), -Year, -Month, -Day,-WeekOfYear, -SurveyDateBefore,-SurveyDateAfter,
+        -rate_reliability,-reach)|>
+   select(any_of(Miss_gages))
+
+Miss_PCA_Complete <- Miss_PCA |>
+  drop_na()
+
+Miss_Viz <- gage_CSAT_joined |>
+  slice(as.numeric(rownames(Miss_PCA_Complete))) |>  # Match rows used in PCA
+  select(SurveyDateAfter, SurveySeason, Day, Month, WeekOfYear,
+         river, pool) |>
+  mutate(
+    season = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+    river_system = factor(river),
+    pool_name = factor(pool),
+    week_of_year = WeekOfYear)
+
+Miss_PCA = prcomp(Miss_PCA_Complete, scale = T, center = T)
+ 
+plot(Miss_PCA,  type="l")
+ 
+a<-autoplot(Miss_PCA,data = Miss_Viz, 
+         color = 'season',loadings = TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+  ggtitle("Season")
+
+b<-autoplot(Miss_PCA,data = Miss_Viz,
+         color = 'pool',loadings= TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+  ggtitle("River Pool")+
+    guides(color = guide_legend(ncol = 3))
+
+
+c<-autoplot(Miss_PCA,data = Miss_Viz,
+         color = 'week_of_year',loadings = TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+        ggtitle("Week ")+
+  labs(color = "Week of Year?")
+
+library(patchwork)
+combined <- a + b + c + plot_layout(ncol = 3)
+
+ggsave("./PCA_Output/Initial_Full_PCA_Miss.png", combined, width = 21, height = 6)
+variable_contributions<- Miss_PCA$rotation
+head(variable_contributions)
+```
+### Compare PCA Results
+```{r}
+# First, let's fix and complete the variance calculations for both rivers
+# Fix IWW variance calculation (you had wrong variable names)
+IWW_explained_variance <- summary(IWW_PCA)$importance[2, ] * 100
+IWW_cumulative_variance <- summary(IWW_PCA)$importance[3, ] * 100
+IWW_eigenvalues <- (IWW_PCA$sdev)^2
+IWW_components_to_retain <- sum(IWW_eigenvalues > 1)
+
+cat("=== IWW PCA RESULTS ===\n")
+cat("Variance explained by first 5 PCs:", round(IWW_explained_variance[1:5], 2), "%\n")
+cat("Cumulative variance by first 5 PCs:", round(IWW_cumulative_variance[1:5], 2), "%\n")
+cat("Components with eigenvalues > 1:", IWW_components_to_retain, "\n")
+
+# Calculate Mississippi variance (you were missing this)
+Miss_explained_variance <- summary(Miss_PCA)$importance[2, ] * 100
+Miss_cumulative_variance <- summary(Miss_PCA)$importance[3, ] * 100
+Miss_eigenvalues <- (Miss_PCA$sdev)^2
+Miss_components_to_retain <- sum(Miss_eigenvalues > 1)
+
+cat("\n=== MISSISSIPPI PCA RESULTS ===\n")
+cat("Variance explained by first 5 PCs:", round(Miss_explained_variance[1:5], 2), "%\n")
+cat("Cumulative variance by first 5 PCs:", round(Miss_cumulative_variance[1:5], 2), "%\n")
+cat("Components with eigenvalues > 1:", Miss_components_to_retain, "\n")
+
+
+# Calculate Combined variance
+Combined_explained_variance <- summary(Combined_PCA)$importance[2, ] * 100
+Combined_cumulative_variance <- summary(Combined_PCA)$importance[3, ] * 100
+Combined_eigenvalues <- (Combined_PCA$sdev)^2
+Combined_components_to_retain <- sum(Combined_eigenvalues > 1)
+
+cat("\n=== COMBINED PCA RESULTS ===\n")
+cat("Variance explained by first 5 PCs:", round(Combined_explained_variance[1:5], 2), "%\n")
+cat("Cumulative variance by first 5 PCs:", round(Combined_cumulative_variance[1:5], 2), "%\n")
+cat("Components with eigenvalues > 1:", Combined_components_to_retain, "\n")
+
+# CREATE COMPARISON TABLE
+comparison_summary <- data.frame(
+  Analysis = c("IWW Only", "Mississippi Only", "Combined"),
+  Observations = c(nrow(IWW_PCA_Complete), nrow(Miss_PCA_Complete), nrow(pca_data_complete)),
+  Variables = c(ncol(IWW_PCA_Complete), ncol(Miss_PCA_Complete), ncol(pca_data_complete)),
+  PC1_Variance = c(round(IWW_explained_variance[1], 2), 
+                   round(Miss_explained_variance[1], 2), 
+                   round(Combined_explained_variance[1], 2)),
+  PC2_Variance = c(round(IWW_explained_variance[2], 2), 
+                   round(Miss_explained_variance[2], 2), 
+                   round(Combined_explained_variance[2], 2)),
+  PC1_PC2_Combined = c(round(IWW_explained_variance[1] + IWW_explained_variance[2], 2),
+                       round(Miss_explained_variance[1] + Miss_explained_variance[2], 2),
+                       round(Combined_explained_variance[1] + Combined_explained_variance[2], 2)),
+  Components_Kaiser = c(IWW_components_to_retain, Miss_components_to_retain, Combined_components_to_retain),
+  Components_80pct = c(which(IWW_cumulative_variance >= 80)[1],
+                       which(Miss_cumulative_variance >= 80)[1],
+                       which(Combined_cumulative_variance >= 80)[1]),
+  Components_85pct = c(which(IWW_cumulative_variance >= 85)[1],
+                       which(Miss_cumulative_variance >= 85)[1],
+                       which(Combined_cumulative_variance >= 85)[1])
+)
+
+cat("\n=== PCA COMPARISON SUMMARY ===\n")
+print(comparison_summary)
+
+# VARIANCE COMPARISON PLOT
+variance_comparison_data <- data.frame(
+  Component = rep(1:10, 3),  # First 10 components
+  Variance_Explained = c(IWW_explained_variance[1:10], 
+                        Miss_explained_variance[1:10], 
+                        Combined_explained_variance[1:10]),
+  Cumulative_Variance = c(IWW_cumulative_variance[1:10], 
+                         Miss_cumulative_variance[1:10], 
+                         Combined_cumulative_variance[1:10]),
+  Analysis = rep(c("IWW Only", "Mississippi Only", "Combined"), each = 10)
+)
+
+# Individual variance plot
+variance_plot <- ggplot(variance_comparison_data, aes(x = Component, y = Variance_Explained, color = Analysis)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  scale_color_viridis_d() +
+  labs(
+    title = "Variance Explained by Principal Components",
+    subtitle = "Comparison: River-Specific vs Combined Analysis",
+    x = "Principal Component",
+    y = "Variance Explained (%)",
+    color = "Analysis Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Cumulative variance plot
+cumulative_plot <- ggplot(variance_comparison_data, aes(x = Component, y = Cumulative_Variance, color = Analysis)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = c(80, 85, 90), linetype = "dashed", alpha = 0.5) +
+  scale_color_viridis_d() +
+  labs(
+    title = "Cumulative Variance Explained",
+    subtitle = "80%, 85%, and 90% thresholds shown",
+    x = "Principal Component", 
+    y = "Cumulative Variance (%)",
+    color = "Analysis Type"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Combine variance plots
+library(patchwork)
+variance_comparison_plots <- variance_plot / cumulative_plot
+ggsave("./PCA_Output/PCA_Variance_Comparison.png", variance_comparison_plots, width = 12, height = 10)
+
+# LOADINGS COMPARISON - TOP VARIABLES FOR PC1
+get_top_loadings <- function(pca_object, pc_num = 1, n_vars = 8) {
+  loadings_data <- data.frame(
+    Variable = rownames(pca_object$rotation),
+    Loading = pca_object$rotation[, pc_num],
+    Abs_Loading = abs(pca_object$rotation[, pc_num])
+  ) %>%
+    arrange(desc(Abs_Loading)) %>%
+    slice_head(n = n_vars) %>%
+    mutate(Rank = row_number())
+  
+  return(loadings_data)
+}
+
+IWW_top_loadings <- get_top_loadings(IWW_PCA) %>% mutate(Analysis = "IWW Only")
+Miss_top_loadings <- get_top_loadings(Miss_PCA) %>% mutate(Analysis = "Mississippi Only")
+Combined_top_loadings <- get_top_loadings(Combined_PCA) %>% mutate(Analysis = "Combined")
+
+all_top_loadings <- bind_rows(IWW_top_loadings, Miss_top_loadings, Combined_top_loadings)
+
+cat("\n=== TOP PC1 LOADINGS COMPARISON ===\n")
+cat("\nIWW Top Variables:\n")
+print(IWW_top_loadings %>% select(Rank, Variable, Loading))
+
+cat("\nMississippi Top Variables:\n")
+print(Miss_top_loadings %>% select(Rank, Variable, Loading))
+
+cat("\nCombined Top Variables:\n")
+print(Combined_top_loadings %>% select(Rank, Variable, Loading))
+
+# LOADINGS HEATMAP COMPARISON
+loadings_heatmap_data <- all_top_loadings %>%
+  select(Variable, Loading, Analysis) %>%
+  pivot_wider(names_from = Analysis, values_from = Loading, values_fill = 0) %>%
+  column_to_rownames("Variable")
+
+# Create heatmap
+library(corrplot)
+png("./PCA_Output/PC1_Loadings_Comparison.png", width = 10, height = 8, units = "in", res = 300)
+corrplot(as.matrix(loadings_heatmap_data), 
+         is.corr = FALSE,
+         method = "color",
+         col = colorRampPalette(c("blue", "white", "red"))(100),
+         title = "PC1 Loadings: River-Specific vs Combined Analysis",
+         mar = c(0, 0, 2, 0),
+         tl.cex = 0.8)
+dev.off()
+
+# OVERLAP ANALYSIS - Which variables are important across approaches?
+variable_frequency <- all_top_loadings %>%
+  count(Variable, sort = TRUE) %>%
+  mutate(
+    Frequency = n,
+    Importance = case_when(
+      n == 3 ~ "Important in All Approaches",
+      n == 2 ~ "Important in Two Approaches", 
+      n == 1 ~ "Approach-Specific"
+    )
+  )
+
+cat("\n=== VARIABLE IMPORTANCE OVERLAP ===\n")
+print(variable_frequency)
+
+overlap_plot <- ggplot(variable_frequency, aes(x = reorder(Variable, Frequency), y = Frequency, fill = Importance)) +
+  geom_col() +
+  scale_fill_viridis_d() +
+  coord_flip() +
+  labs(
+    title = "Variable Importance Across PCA Approaches",
+    subtitle = "How many approaches identify each variable as top contributor to PC1",
+    x = "Variable",
+    y = "Number of Approaches",
+    fill = "Importance Level"
+  ) +
+  theme_minimal()
+
+ggsave("./PCA_Output/Variable_Importance_Overlap.png", overlap_plot, width = 10, height = 8)
+
+
+
+
+```
+
+###xGBoost
+```{r}
+cat("\n=== XGBOOST WITH TEMPORAL CROSS-VALIDATION ===\n")
+cat("CRITICAL: Using expanding window temporal CV for all datasets\n\n")
+
+train_xgboost_temporal <- function(data, splits, gages_to_use, dataset_name) {
+  
+  
+  cat(sprintf("=== Training xGBoost: %s ===\n", dataset_name))
+  
+  # Prepare features
+  xgb_data <- data %>%
+    select(
+      AnnualShoalingRate_ftperyr, 
+      WeekOfYear,
+      any_of(gages_to_use)
+    ) |>
+    drop_na()
+  
+  # Create temporal index for CV
+  xgb_data_temporal <- data %>%
+    drop_na() %>%
+    arrange(SurveyDateAfter) %>%
+    mutate(temporal_index = row_number())
+  
+  # Extract only the features and target
+  xgb_features <- xgb_data_temporal %>%
+    select(AnnualShoalingRate_ftperyr, WeekOfYear, any_of(gages_to_use)) %>%
+    drop_na()
+  
+  n_samples <- nrow(xgb_features)
+  n_folds <- 5
+  
+  # Create expanding window temporal folds
+  temporal_indices <- lapply(1:n_folds, function(i) {
+    test_start <- floor(n_samples * i / (n_folds + 1))
+    test_end <- floor(n_samples * (i + 1) / (n_folds + 1))
+    
+    list(
+      train = 1:(test_start - 1),
+      test = test_start:test_end
+    )
+  })
+  
+  # Remove folds with insufficient training data
+  temporal_indices <- temporal_indices[sapply(temporal_indices, 
+                                              function(x) length(x$train) > 50)]
+  
+  # Set up temporal CV control
+  ctrl_temporal <- trainControl(
+    method = "cv",
+    number = length(temporal_indices),
+    index = lapply(temporal_indices, `[[`, "train"),
+    indexOut = lapply(temporal_indices, `[[`, "test"),
+    verboseIter = FALSE,
+    allowParallel = TRUE,
+    savePredictions = "final"
+  )
+  
+  # Tune grid (optimized from your experiments)
+  tune_grid <- expand.grid(
+    nrounds = c(100, 200),
+    max_depth = c(4, 5),
+    eta = c(0.1, 0.15),
+    gamma = c(0, 0.1),
+    colsample_bytree = c(0.6, 0.8, 1.0),
+    min_child_weight = c(1, 3, 5),
+    subsample = c(0.8, 1.0)
+  )
+  
+  cat(sprintf("Training with %d temporal CV folds...\n", length(temporal_indices)))
+  
+  # Train model
+  set.seed(118)
+  
+  start_time <- Sys.time()
+  xgb_model <- caret::train(
+    AnnualShoalingRate_ftperyr ~ .,
+    data = xgb_features,
+    method = "xgbTree",
+    tuneGrid = tune_grid,
+    trControl = ctrl_temporal,
+    metric = "RMSE",
+    verbose = FALSE
+  )
+  end_time <- Sys.time()
+  training_time <- end_time - start_time
+  
+  # Results
+  cat(sprintf("Training time: %.2f minutes\n", as.numeric(training_time, units = "mins")))
+  cat(sprintf("Best CV RMSE: %.4f\n", min(xgb_model$results$RMSE)))
+  cat(sprintf("Best hyperparameters: nrounds=%d, max_depth=%d, eta=%.3f\n",
+              xgb_model$bestTune$nrounds,
+              xgb_model$bestTune$max_depth,
+              xgb_model$bestTune$eta))
+  
+  
+  # Test set predictions
+  test_data <- data[splits$test_idx, ] %>%
+    select(AnnualShoalingRate_ftperyr, WeekOfYear,any_of(gages_to_use), SurveyDateAfter) %>%
+    drop_na()
+  
+  test_pred <- predict(xgb_model, newdata = test_data)
+  test_rmse <- sqrt(mean((test_pred - test_data$AnnualShoalingRate_ftperyr)^2))
+  test_mae <- mean(abs(test_pred - test_data$AnnualShoalingRate_ftperyr))
+  test_r2 <- cor(test_pred, test_data$AnnualShoalingRate_ftperyr)^2
+  
+  cat(sprintf("Test RMSE: %.4f, MAE: %.4f, R²: %.4f\n\n", test_rmse, test_mae, test_r2))
+  
+  return(list(
+    model = xgb_model,
+    metrics = data.frame(
+      Dataset = dataset_name,
+      Model = "xGBoost",
+      CV_RMSE = min(xgb_model$results$RMSE),
+      Test_RMSE = test_rmse,
+      Test_MAE = test_mae,
+      Test_R2 = test_r2
+    ),
+    predictions = data.frame(
+      actual = test_data$AnnualShoalingRate_ftperyr,
+      predicted = test_pred,
+      date = test_data$SurveyDateAfter
+    )
+  ))
+}
+
+# Get gage IDs for each river
+IWW_gages <- gage_metadata %>% filter(River == "IWW") %>% pull(Gage_ID)
+Miss_gages <- gage_metadata %>% filter(River == "Miss") %>% pull(Gage_ID)
+All_gages <- gage_metadata %>% pull(Gage_ID)
+
+IWW_xgb <- train_xgboost_temporal(IWW_data, IWW_splits, IWW_gages, "Illinois Waterway")
+Miss_xgb <- train_xgboost_temporal(Miss_data, Miss_splits, Miss_gages, "Mississippi River")
+Combined_xgb <- train_xgboost_temporal(gage_CSAT_joined, Combined_splits, 
+                                       All_gages, "Combined")
+
+```
+### Variable Importance
+```{r}
+cat("\n=== VARIABLE IMPORTANCE ===\n")
+
+# IWW importance
+cat("\nIWW Variable Importance:\n")
+iww_importance <- varImp(IWW_xgb$model)
+print(iww_importance)
+
+# Mississippi importance
+cat("\nMississippi Variable Importance:\n")
+miss_importance <- varImp(Miss_xgb$model)
+print(miss_importance)
+
+# Combined importance
+cat("\nCombined Variable Importance:\n")
+combined_importance <- varImp(Combined_xgb$model)
+print(combined_importance)
+
+# Feature importance plots
+iww_import_matrix <- xgb.importance(model = IWW_xgb$model$finalModel)
+miss_import_matrix <- xgb.importance(model = Miss_xgb$model$finalModel)
+combined_import_matrix <- xgb.importance(model = Combined_xgb$model$finalModel)
+
+# Save importance plots
+png("./xGB_Output/IWW_xgboost_importance.png", width = 12, height = 8, units = "in", res = 300)
+xgb.plot.importance(iww_import_matrix[1:10,], main = "Top 10 Features - Illinois Waterway",cex = 1.5)
+dev.off()
+
+png("./xGB_Output/Mississippi_xgboost_importance.png", width = 12, height = 8, units = "in", res = 300)
+xgb.plot.importance(miss_import_matrix[1:10,], main = "Top 10 Features - Mississippi River",cex = 1.5)
+dev.off()
+
+png("./xGB_Output/Combined_xgboost_importance.png", width = 12, height = 8, units = "in", res = 300)
+xgb.plot.importance(combined_import_matrix[1:10,], main = "Top 10 Features - Combined Rivers", cex = 1.5)
+dev.off()
+```
+
+
+### LSTM
+```{r}
+### LSTM MODEL FOR SHOALING RATE FORECASTING
+### Temporal Forecasting for Predictive Dredging Operations
+
+library(keras3)
+library(tensorflow)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(timetk)
+
+# Ensure TensorFlow is properly set up
+#tensorflow::install_tensorflow()  # Run once if needed
+
+cat("=== LSTM TEMPORAL FORECASTING FOR SHOALING PREDICTION ===\n")
+cat("Following ARA presentation approach: LSTM for time series regression → classification\n\n")
+
+# ===================================================================
+# 1. DATA PREPARATION FOR LSTM (Following Your Project Approach)
+# ===================================================================
+
+prepare_lstm_data_multistep <- function(data, splits, gages_to_use, 
+                                       sequence_length = 30,
+                                       forecast_horizon = 45,
+                                       dataset_name) {
+  
+cat(sprintf("=== Preparing LSTM Data: %s ===\n", dataset_name))
+  
+  # Prepare features (must be in temporal order)
+  feature_data <- data %>%
+    select(
+      SurveyDateAfter, 
+      AnnualShoalingRate_ftperyr,
+      DaysBetween,
+      any_of(gages_to_use)
+    ) %>%
+    arrange(SurveyDateAfter) %>%
+    drop_na()
+  
+  cat(sprintf("Data prepared: %d observations, %d features\n", 
+              nrow(feature_data), ncol(feature_data) - 2))
+  
+  if(nrow(feature_data) < sequence_length + forecast_horizon + 10) {
+    cat("WARNING: Insufficient data for LSTM sequences\n")
+    return(NULL)
+  }
+  
+  # Extract features and scale
+  gage_features <- feature_data %>%
+    select(-SurveyDateAfter, -AnnualShoalingRate_ftperyr) %>%
+    as.matrix()
+  
+  feature_means <- apply(gage_features, 2, mean, na.rm = TRUE)
+  feature_sds <- apply(gage_features, 2, sd, na.rm = TRUE)
+  feature_sds[feature_sds == 0] <- 1
+  
+  scaled_features <- scale(gage_features, center = feature_means, scale = feature_sds)
+  
+  target_values <- feature_data$AnnualShoalingRate_ftperyr
+  dates <- feature_data$SurveyDateAfter
+  
+  # Create sequences for LSTM
+  # X: [samples, sequence_length, n_features]
+  # y: [samples, forecast_horizon] <- MULTIPLE OUTPUTS
+  
+  n_samples <- nrow(scaled_features) - sequence_length - forecast_horizon + 1
+  n_features <- ncol(scaled_features)
+  
+  X <- array(0, dim = c(n_samples, sequence_length, n_features))
+  y <- matrix(0, nrow = n_samples, ncol = forecast_horizon)
+  sample_dates <- character(n_samples)
+  
+  for(i in 1:n_samples) {
+    # Input: sequence_length historical observations
+    X[i, , ] <- scaled_features[i:(i + sequence_length - 1), ]
+    
+    # Output: forecast_horizon future values
+    y[i, ] <- target_values[(i + sequence_length):(i + sequence_length + forecast_horizon - 1)]
+    
+    # Date of the last forecast
+    sample_dates[i] <- as.character(dates[i + sequence_length + forecast_horizon - 1])
+  }
+  
+  cat(sprintf("LSTM sequences created: %d samples\n", n_samples))
+  cat(sprintf("  Input shape: [%d, %d, %d] (samples, timesteps, features)\n",
+              n_samples, sequence_length, n_features))
+  cat(sprintf("  Output shape: [%d, %d] (samples, forecast_horizon)\n",
+              n_samples, forecast_horizon))
+  
+  # Split into train/val/test using temporal indices
+  train_size <- floor(n_samples * 0.70)
+  val_size <- floor(n_samples * 0.15)
+  
+  lstm_splits <- list(
+    X_train = X[1:train_size, , , drop = FALSE],
+    X_val = X[(train_size + 1):(train_size + val_size), , , drop = FALSE],
+    X_test = X[(train_size + val_size + 1):n_samples, , , drop = FALSE],
+    
+    y_train = y[1:train_size, ],
+    y_val = y[(train_size + 1):(train_size + val_size), ],
+    y_test = y[(train_size + val_size + 1):n_samples, ],
+    
+    dates_train = sample_dates[1:train_size],
+    dates_val = sample_dates[(train_size + 1):(train_size + val_size)],
+    dates_test = sample_dates[(train_size + val_size + 1):n_samples],
+    
+    scalers = list(means = feature_means, sds = feature_sds),
+    sequence_length = sequence_length,
+    forecast_horizon = forecast_horizon,
+    n_features = n_features,
+    dataset_name = dataset_name
+  )
+  
+  cat(sprintf("Temporal splits: Train=%d, Val=%d, Test=%d\n\n",
+              dim(lstm_splits$X_train)[1],
+              dim(lstm_splits$X_val)[1],
+              dim(lstm_splits$X_test)[1]))
+  
+  return(lstm_splits)
+}
+
+
+
+build_lstm <- function(sequence_length, n_features, forecast_horizon) {
+
+  model <- keras_model_sequential() |>
+    layer_lstm(units = 128, return_sequences = TRUE,
+               input_shape = c(sequence_length, n_features),
+               dropout = 0.2, recurrent_dropout = 0.2) |>
+    layer_lstm(units = 64, return_sequences = FALSE,
+               dropout = 0.2, recurrent_dropout = 0.2) |>
+    layer_dense(units = 64, activation = 'relu') |>
+    layer_dropout(rate = 0.3) %>%
+    # OUTPUT: forecast_horizon predictions
+    layer_dense(units = forecast_horizon, activation = 'linear')
+  
+  model |> compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss = 'mse',
+    metrics = c('mae')
+  )
+  
+  return(model)
+}
+
+
+# ===================================================================
+#  TRAIN LSTM MODELS 
+# ===================================================================
+
+train_lstm_multistep <- function(lstm_data, dataset_name) {
+
+  if(is.null(lstm_data)) {
+    cat(sprintf("Skipping %s - insufficient data\n", dataset_name))
+    return(NULL)
+  }
+  
+  cat(sprintf("\n=== Training LSTM: %s ===\n", dataset_name))
+  cat(sprintf("Predicting %d time steps ahead\n", lstm_data$forecast_horizon))
+  
+  # Build model
+  model <- build_lstm(
+    sequence_length = lstm_data$sequence_length,
+    n_features = lstm_data$n_features,
+    forecast_horizon = lstm_data$forecast_horizon
+  )
+  
+  # Callbacks
+  early_stopping <- callback_early_stopping(
+    monitor = 'val_loss',
+    patience = 20,
+    restore_best_weights = TRUE
+  )
+  
+  reduce_lr <- callback_reduce_lr_on_plateau(
+    monitor = 'val_loss',
+    factor = 0.5,
+    patience = 10,
+    min_lr = 1e-6
+  )
+  
+  # Train
+  cat("Training LSTM model...\n")
+  history <- model |> fit(
+    x = lstm_data$X_train,
+    y = lstm_data$y_train,
+    validation_data = list(lstm_data$X_val, lstm_data$y_val),
+    epochs = 100,
+    batch_size = 32,
+    callbacks = list(early_stopping, reduce_lr),
+    verbose = 1
+  )
+  
+  # Evaluate on test set
+  test_pred <- predict(model, lstm_data$X_test)
+  
+  # Calculate metrics (average across all forecast horizons)
+  test_rmse <- sqrt(mean((test_pred - lstm_data$y_test)^2))
+  test_mae <- mean(abs(test_pred - lstm_data$y_test))
+  
+  # Also calculate for first time step (1-step ahead)
+  test_rmse_1step <- sqrt(mean((test_pred[, 1] - lstm_data$y_test[, 1])^2))
+  test_mae_1step <- mean(abs(test_pred[, 1] - lstm_data$y_test[, 1]))
+  
+  cat(sprintf("\nTest Performance:\n"))
+  cat(sprintf("  All %d steps - RMSE: %.4f, MAE: %.4f\n", 
+              lstm_data$forecast_horizon, test_rmse, test_mae))
+  cat(sprintf("  1-step ahead - RMSE: %.4f, MAE: %.4f\n\n", 
+              test_rmse_1step, test_mae_1step))
+  
+  return(list(
+    model = model,
+    history = history,
+    metrics = data.frame(
+      Dataset = dataset_name,
+      Model = "LSTM",
+      Test_RMSE_All = test_rmse,
+      Test_MAE_All = test_mae,
+      Test_RMSE_1Step = test_rmse_1step,
+      Test_MAE_1Step = test_mae_1step,
+      Forecast_Horizon = lstm_data$forecast_horizon
+    ),
+    predictions = list(
+      actual = lstm_data$y_test,
+      predicted = test_pred,
+      dates = lstm_data$dates_test
+    )
+  ))
+}
+# ===================================================================
+# Prepare and train LSTM models
+# ===================================================================
+cat("Preparing LSTM data with 45-day forecast horizon...\n")
+
+IWW_lstm_data <- prepare_lstm_data_multistep(
+  IWW_data, IWW_splits, IWW_gages,
+  sequence_length = 20,
+  forecast_horizon = 45,
+  dataset_name = "Illinois Waterway"
+)
+
+Miss_lstm_data <- prepare_lstm_data_multistep(
+  Miss_data, Miss_splits, Miss_gages,
+  sequence_length = 30,
+  forecast_horizon = 45,
+  dataset_name = "Mississippi River"
+)
+
+Combined_lstm_data <- prepare_lstm_data_multistep(
+  gage_CSAT_joined, Combined_splits, All_gages,
+  sequence_length = 25,
+  forecast_horizon = 45,
+  dataset_name = "Combined"
+)
+
+# Train LSTM models
+IWW_lstm <- train_lstm_multistep(IWW_lstm_data, "Illinois Waterway")
+Miss_lstm <- train_lstm_multistep(Miss_lstm_data, "Mississippi River")
+Combined_lstm <- train_lstm_multistep(Combined_lstm_data, "Combined")
+
+
+# ===================================================================
+# Create Binary Classifier from Model Output
+# ===================================================================
+
+cat("\n=== BINARY DREDGING CLASSIFICATION ===\n")
+cat("NEW LOGIC: YES if rate > 0 OR rate is increasing over time\n\n")
+
+create_dredging_classification_updated <- function(predictions_df, dataset_name,
+                                                   window_size = 5) {
+  cat(sprintf("=== %s Binary Classification ===\n", dataset_name))
+  
+  # Calculate trend using rolling window
+  predictions_df <- predictions_df %>%
+    arrange(date) %>%
+    mutate(
+      # Binary: Is shoaling rate positive?
+      is_positive = actual > 0,
+      
+      # Calculate trend: is rate increasing?
+      trend = zoo::rollapply(
+        actual, 
+        width = window_size, 
+        FUN = function(x) {
+          if(length(x) < 2) return(0)
+          # Simple linear trend
+          coef(lm(x ~ seq_along(x)))[2]
+        },
+        fill = 0,
+        align = "right"
+      ),
+      
+      is_increasing = trend > 0,
+      
+      # NEW CLASSIFICATION LOGIC
+      actual_binary = ifelse(is_positive | is_increasing, "YES", "NO"),
+      predicted_binary = ifelse(predicted > 0, "YES", "NO")  # Simple threshold for predicted
+    )
+  
+  # Calculate classification metrics
+  confusion <- table(Actual = predictions_df$actual_binary,
+                    Predicted = predictions_df$predicted_binary)
+  
+  accuracy <- mean(predictions_df$actual_binary == predictions_df$predicted_binary)
+  
+  # Calculate precision, recall, F1
+  if(nrow(as.data.frame(confusion)) >= 4) {
+    TP <- confusion["YES", "YES"]
+    FP <- confusion["NO", "YES"]
+    FN <- confusion["YES", "NO"]
+    TN <- confusion["NO", "NO"]
+    
+    precision <- TP / (TP + FP)
+    recall <- TP / (TP + FN)
+    f1 <- 2 * (precision * recall) / (precision + recall)
+  } else {
+    precision <- recall <- f1 <- NA
+  }
+  
+  cat(sprintf("Classification Logic:\n"))
+  cat(sprintf("  Dredging = YES if: rate > 0 OR trend > 0 (increasing)\n"))
+  cat(sprintf("  Window size for trend: %d observations\n", window_size))
+  cat(sprintf("\nResults:\n"))
+  cat(sprintf("  Accuracy: %.3f\n", accuracy))
+  cat(sprintf("  Precision: %.3f\n", precision))
+  cat(sprintf("  Recall: %.3f\n", recall))
+  cat(sprintf("  F1 Score: %.3f\n", f1))
+  cat("\nConfusion Matrix:\n")
+  print(confusion)
+  cat("\n")
+  
+  # Distribution of classifications
+  class_dist <- predictions_df %>%
+    count(actual_binary) %>%
+    mutate(pct = n / sum(n) * 100)
+  
+  cat("Actual Distribution:\n")
+  print(class_dist)
+  
+  return(list(
+    classified_data = predictions_df,
+    confusion_matrix = confusion,
+    metrics = data.frame(
+      Dataset = dataset_name,
+      Accuracy = accuracy,
+      Precision = precision,
+      Recall = recall,
+      F1_Score = f1,
+      Positive_Pct = class_dist$pct[class_dist$actual_binary == "YES"]
+    )
+  ))
+}
+
+# Apply new classification to all model predictions
+cat("\nApplying binary classification to xGBoost predictions:\n\n")
+
+IWW_xgb_binary <- create_dredging_classification_updated(
+  IWW_xgb$predictions, "Illinois Waterway - xGBoost"
+)
+
+Miss_xgb_binary <- create_dredging_classification_updated(
+  Miss_xgb$predictions, "Mississippi River - xGBoost"
+)
+
+Combined_xgb_binary <- create_dredging_classification_updated(
+  Combined_xgb$predictions, "Combined - xGBoost"
+)
+
+# For LSTM, we'll use the 1-step ahead predictions for classification
+if(!is.null(IWW_lstm)) {
+  IWW_lstm_pred_df <- data.frame(
+    actual = IWW_lstm$predictions$actual[, 1],  # 1-step ahead
+    predicted = IWW_lstm$predictions$predicted[, 1],
+    date = as.Date(IWW_lstm$predictions$dates)
+  )
+  IWW_lstm_binary <- create_dredging_classification_updated(
+    IWW_lstm_pred_df, "Illinois Waterway - LSTM"
+  )
+}
+
+if(!is.null(Miss_lstm)) {
+  Miss_lstm_pred_df <- data.frame(
+    actual = Miss_lstm$predictions$actual[, 1],
+    predicted = Miss_lstm$predictions$predicted[, 1],
+    date = as.Date(Miss_lstm$predictions$dates)
+  )
+  Miss_lstm_binary <- create_dredging_classification_updated(
+    Miss_lstm_pred_df, "Mississippi River - LSTM"
+  )
+}
+
+if(!is.null(Combined_lstm)) {
+  Combined_lstm_pred_df <- data.frame(
+    actual = Combined_lstm$predictions$actual[, 1],
+    predicted = Combined_lstm$predictions$predicted[, 1],
+    date = as.Date(Combined_lstm$predictions$dates)
+  )
+  Combined_lstm_binary <- create_dredging_classification_updated(
+    Combined_lstm_pred_df, "Combined - LSTM"
+  )
+}
+
+```
+
+### Plots
+```{r}
+# ===================================================================
+# TIME SERIES PLOTS: ACTUAL VS PREDICTED SHOALING RATES
+# ===================================================================
+
+library(gridExtra)  # For arranging multiple plots
+
+# Function to create time series comparison plot
+plot_predictions_timeseries <- function(pred_df, dataset_name, model_type) {
+  
+  # Reshape data for plotting
+  plot_data <- pred_df %>%
+    select(date, actual, predicted) %>%
+    tidyr::pivot_longer(
+      cols = c(actual, predicted),
+      names_to = "type",
+      values_to = "shoaling_rate"
+    ) %>%
+    mutate(
+      type = factor(type, levels = c("actual", "predicted"),
+                   labels = c("Actual", "Predicted"))
+    )
+  
+  # Create plot
+  p <- ggplot(plot_data, aes(x = date, y = shoaling_rate, color = type)) +
+    geom_line(linewidth = 0.8, alpha = 0.8) +
+    geom_point(size = 1.5, alpha = 0.6) +
+    scale_color_manual(values = c("Actual" = "#2166AC", "Predicted" = "#D6604D")) +
+    labs(
+      title = sprintf("%s - %s Model", dataset_name, model_type),
+      subtitle = "Time Series Comparison: Actual vs Predicted Shoaling Rates",
+      x = "Date",
+      y = "Annual Shoaling Rate (ft/yr)",
+      color = ""
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "gray30"),
+      legend.position = "bottom",
+      legend.text = element_text(size = 11),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "gray90", linewidth = 0.3)
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5)
+  
+  return(p)
+}
+
+
+# Function to create scatter plot with residuals
+plot_predictions_scatter <- function(pred_df, dataset_name, model_type) {
+  
+  # Calculate metrics
+  rmse <- sqrt(mean((pred_df$predicted - pred_df$actual)^2))
+  mae <- mean(abs(pred_df$predicted - pred_df$actual))
+  r2 <- cor(pred_df$actual, pred_df$predicted)^2
+  
+  p <- ggplot(pred_df, aes(x = actual, y = predicted)) +
+    geom_point(alpha = 0.6, size = 2.5, color = "#4575B4") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", 
+                color = "red", linewidth = 1) +
+    geom_smooth(method = "lm", se = TRUE, color = "#D73027", 
+                fill = "#D73027", alpha = 0.2) +
+    labs(
+      title = sprintf("%s - %s Model", dataset_name, model_type),
+      subtitle = sprintf("RMSE: %.3f | MAE: %.3f | R²: %.3f", rmse, mae, r2),
+      x = "Actual Shoaling Rate (ft/yr)",
+      y = "Predicted Shoaling Rate (ft/yr)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10, color = "gray30"),
+      panel.grid.minor = element_blank()
+    ) +
+    coord_fixed()
+  
+  return(p)
+}
+
+
+# ===================================================================
+# CREATE ALL PLOTS
+# ===================================================================
+
+cat("\n=== Generating Time Series Visualizations ===\n\n")
+
+# xGBoost Time Series Plots
+cat("Creating xGBoost time series plots...\n")
+p_iww_xgb_ts <- plot_predictions_timeseries(IWW_xgb$predictions, 
+                                            "Illinois Waterway", "xGBoost")
+p_miss_xgb_ts <- plot_predictions_timeseries(Miss_xgb$predictions, 
+                                             "Mississippi River", "xGBoost")
+p_comb_xgb_ts <- plot_predictions_timeseries(Combined_xgb$predictions, 
+                                             "Combined Dataset", "xGBoost")
+
+# xGBoost Scatter Plots
+cat("Creating xGBoost scatter plots...\n")
+p_iww_xgb_sc <- plot_predictions_scatter(IWW_xgb$predictions, 
+                                        "Illinois Waterway", "xGBoost")
+p_miss_xgb_sc <- plot_predictions_scatter(Miss_xgb$predictions, 
+                                         "Mississippi River", "xGBoost")
+p_comb_xgb_sc <- plot_predictions_scatter(Combined_xgb$predictions, 
+                                         "Combined Dataset", "xGBoost")
+
+# LSTM Time Series Plots (if models exist)
+if(!is.null(IWW_lstm)) {
+  cat("Creating LSTM time series plots...\n")
+  p_iww_lstm_ts <- plot_predictions_timeseries(IWW_lstm_pred_df, 
+                                               "Illinois Waterway", "LSTM")
+  p_iww_lstm_sc <- plot_predictions_scatter(IWW_lstm_pred_df, 
+                                           "Illinois Waterway", "LSTM")
+}
+
+if(!is.null(Miss_lstm)) {
+  p_miss_lstm_ts <- plot_predictions_timeseries(Miss_lstm_pred_df, 
+                                                "Mississippi River", "LSTM")
+  p_miss_lstm_sc <- plot_predictions_scatter(Miss_lstm_pred_df, 
+                                            "Mississippi River", "LSTM")
+}
+
+if(!is.null(Combined_lstm)) {
+  p_comb_lstm_ts <- plot_predictions_timeseries(Combined_lstm_pred_df, 
+                                                "Combined Dataset", "LSTM")
+  p_comb_lstm_sc <- plot_predictions_scatter(Combined_lstm_pred_df, 
+                                            "Combined Dataset", "LSTM")
+}
+
+# ===================================================================
+# DISPLAY PLOTS
+# ===================================================================
+
+# Display xGBoost time series
+print(p_iww_xgb_ts)
+print(p_miss_xgb_ts)
+print(p_comb_xgb_ts)
+
+# Display xGBoost scatter plots
+print(p_iww_xgb_sc)
+print(p_miss_xgb_sc)
+print(p_comb_xgb_sc)
+
+# Display LSTM plots if available
+if(!is.null(IWW_lstm)) {
+  print(p_iww_lstm_ts)
+  print(p_iww_lstm_sc)
+}
+
+if(!is.null(Miss_lstm)) {
+  print(p_miss_lstm_ts)
+  print(p_miss_lstm_sc)
+}
+
+if(!is.null(Combined_lstm)) {
+  print(p_comb_lstm_ts)
+  print(p_comb_lstm_sc)
+}
+
+
+# ===================================================================
+# COMBINED COMPARISON PLOTS
+# ===================================================================
+
+cat("\n=== Creating Combined Comparison Plots ===\n")
+
+# Function to create faceted comparison across all datasets
+create_faceted_comparison <- function() {
+  
+  # Combine all xGBoost predictions
+  all_xgb_data <- bind_rows(
+    IWW_xgb$predictions %>% mutate(Dataset = "Illinois Waterway"),
+    Miss_xgb$predictions %>% mutate(Dataset = "Mississippi River"),
+    Combined_xgb$predictions %>% mutate(Dataset = "Combined")
+  ) %>%
+    mutate(Model = "xGBoost")
+  
+  # Combine LSTM predictions if they exist
+  if(!is.null(IWW_lstm) && !is.null(Miss_lstm) && !is.null(Combined_lstm)) {
+    all_lstm_data <- bind_rows(
+      IWW_lstm_pred_df %>% mutate(Dataset = "Illinois Waterway"),
+      Miss_lstm_pred_df %>% mutate(Dataset = "Mississippi River"),
+      Combined_lstm_pred_df %>% mutate(Dataset = "Combined")
+    ) %>%
+      mutate(Model = "LSTM")
+    
+    all_data <- bind_rows(all_xgb_data, all_lstm_data)
+  } else {
+    all_data <- all_xgb_data
+  }
+  
+  # Reshape for plotting
+  plot_data <- all_data %>%
+    select(date, actual, predicted, Dataset, Model) %>%
+    tidyr::pivot_longer(
+      cols = c(actual, predicted),
+      names_to = "type",
+      values_to = "shoaling_rate"
+    )
+  
+  # Create faceted plot
+  p <- ggplot(plot_data, aes(x = date, y = shoaling_rate, color = type)) +
+    geom_line(linewidth = 0.6, alpha = 0.7) +
+    geom_point(size = 1, alpha = 0.5) +
+    scale_color_manual(
+      values = c("actual" = "#2166AC", "predicted" = "#D6604D"),
+      labels = c("Actual", "Predicted")
+    ) +
+    facet_grid(Dataset ~ Model, scales = "free_y") +
+    labs(
+      title = "Shoaling Rate Predictions: Model Comparison Across Datasets",
+      x = "Date",
+      y = "Annual Shoaling Rate (ft/yr)",
+      color = ""
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+      legend.position = "bottom",
+      strip.text = element_text(face = "bold", size = 10),
+      panel.spacing = unit(1, "lines")
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.3)
+  
+  return(p)
+}
+
+p_combined_faceted <- create_faceted_comparison()
+print(p_combined_faceted)
+
+# Save plots (optional)
+# ggsave("xgboost_predictions_comparison.png", p_combined_faceted, 
+#        width = 14, height = 10, dpi = 300)
+
+cat("\n=== Plotting Complete ===\n")
+```
+
+
+
+###Comprehensive Model Comparison
+```{r}
+compile_all_results <- function() {
+  # Regression results
+  regression_results <- bind_rows(
+    IWW_baselines$results %>% mutate(River = "Illinois Waterway"),
+    Miss_baselines$results %>% mutate(River = "Mississippi River"),
+    Combined_baselines$results %>% mutate(River = "Combined"),
+    
+    IWW_xgb$metrics %>% 
+      select(Dataset, Model, Test_RMSE, Test_MAE) %>%
+      mutate(River = "Illinois Waterway", Type = "ML"),
+    Miss_xgb$metrics %>%
+      select(Dataset, Model, Test_RMSE, Test_MAE) %>%
+      mutate(River = "Mississippi River", Type = "ML"),
+    Combined_xgb$metrics %>%
+      select(Dataset, Model, Test_RMSE, Test_MAE) %>%
+      mutate(River = "Combined", Type = "ML")
+  )
+  
+  # Add LSTM results if available
+  if(!is.null(IWW_lstm)) {
+    regression_results <- bind_rows(
+      regression_results,
+      IWW_lstm$metrics %>%
+        mutate(
+          Model = "LSTM",
+          Test_RMSE = Test_RMSE_1Step,
+          Test_MAE = Test_MAE_1Step,
+          River = "Illinois Waterway",
+          Type = "ML"
+        ) %>%
+        select(Dataset, Model, Test_RMSE, Test_MAE, River, Type)
+    )
+  }
+  
+  if(!is.null(Miss_lstm)) {
+    regression_results <- bind_rows(
+      regression_results,
+      Miss_lstm$metrics %>%
+        mutate(
+          Model = "LSTM",
+          Test_RMSE = Test_RMSE_1Step,
+          Test_MAE = Test_MAE_1Step,
+          River = "Mississippi River",
+          Type = "ML"
+        ) %>%
+        select(Dataset, Model, Test_RMSE, Test_MAE, River, Type)
+    )
+  }
+  
+  if(!is.null(Combined_lstm)) {
+    regression_results <- bind_rows(
+      regression_results,
+      Combined_lstm$metrics %>%
+        mutate(
+          Model = "LSTM",
+          Test_RMSE = Test_RMSE_1Step,
+          Test_MAE = Test_MAE_1Step,
+          River = "Combined",
+          Type = "ML"
+        ) %>%
+        select(Dataset, Model, Test_RMSE, Test_MAE, River, Type)
+    )
+  }
+  
+  # Binary classification results
+  classification_results <- bind_rows(
+    IWW_xgb_binary$metrics %>% mutate(Model = "xGBoost"),
+    Miss_xgb_binary$metrics %>% mutate(Model = "xGBoost"),
+    Combined_xgb_binary$metrics %>% mutate(Model = "xGBoost")
+  )
+  
+  if(!is.null(IWW_lstm_binary)) {
+    classification_results <- bind_rows(
+      classification_results,
+      IWW_lstm_binary$metrics %>% mutate(Model = "LSTM")
+    )
+  }
+  
+  if(!is.null(Miss_lstm_binary)) {
+    classification_results <- bind_rows(
+      classification_results,
+      Miss_lstm_binary$metrics %>% mutate(Model = "LSTM")
+    )
+  }
+  
+  if(!is.null(Combined_lstm_binary)) {
+    classification_results <- bind_rows(
+      classification_results,
+      Combined_lstm_binary$metrics %>% mutate(Model = "LSTM")
+    )
+  }
+  
+  return(list(
+    regression = regression_results,
+    classification = classification_results
+  ))
+}
+
+all_compiled_results <- compile_all_results()
+
+# ============================================================================
+# PART 2: SELECT BEST MODEL FOR EACH RIVER
+# ============================================================================
+
+select_best_models <- function(regression_results, classification_results) {
+  # Best for regression (RMSE)
+  best_regression <- regression_results %>%
+    group_by(River) %>%
+    slice_min(Test_RMSE, n = 1) %>%
+    ungroup() %>%
+    mutate(Criterion = "Regression (RMSE)")
+  
+  # Best for classification (F1 Score)
+  best_classification <- classification_results %>%
+    group_by(Dataset) %>%
+    slice_max(F1_Score, n = 1, na_rm = TRUE) %>%
+    ungroup() %>%
+    rename(River = Dataset) %>%
+    mutate(Criterion = "Classification (F1)")
+  
+  # Best overall (balanced RMSE and accuracy)
+  overall_scores <- regression_results %>%
+    filter(Model %in% c("xGBoost", "LSTM")) %>%
+    left_join(
+      classification_results %>%
+        select(Dataset, Model, Accuracy, F1_Score),
+      by = c("River" = "Dataset", "Model" = "Model")
+    ) %>%
+    mutate(
+      # Normalize RMSE (lower is better)
+      RMSE_normalized = (max(Test_RMSE) - Test_RMSE) / (max(Test_RMSE) - min(Test_RMSE)),
+      # Normalize accuracy (higher is better)
+      Accuracy_normalized = Accuracy,
+      # Combined score (equal weighting)
+      Combined_Score = (RMSE_normalized + Accuracy_normalized) / 2
+    ) %>%
+    group_by(River) %>%
+    slice_max(Combined_Score, n = 1) %>%
+    ungroup() %>%
+    mutate(Criterion = "Overall (Balanced)")
+  
+  return(list(
+    regression = best_regression,
+    classification = best_classification,
+    overall = overall_scores
+  ))
+}
+
+best_models <- select_best_models(
+  all_compiled_results$regression,
+  all_compiled_results$classification
+)
+```
+
+### Performance Summaries 
+```{r}
+
+### Regression 
+for(river in unique(all_compiled_results$regression$River)) {
+  
+  river_data <- all_compiled_results$regression %>%
+    filter(River == river) %>%
+    arrange(Test_RMSE) %>%
+    mutate(
+      Rank = row_number(),
+      Improvement_vs_Best_Baseline = sprintf("%.1f%%",
+        (Test_RMSE[Model %in% c("Persistence", "Mean", "ARIMA")][1] - Test_RMSE) / 
+        Test_RMSE[Model %in% c("Persistence", "Mean", "ARIMA")][1] * 100
+      )
+    )
+  
+  cat(sprintf("┌─ %s %s\n", river, paste(rep("─", 60 - nchar(river)), collapse = "")))
+  cat("│\n")
+  
+  # Create formatted table
+  for(i in 1:nrow(river_data)) {
+    row <- river_data[i, ]
+    
+    # Add emoji for best model
+    emoji <- ifelse(row$Rank == 1, "🏆", 
+                   ifelse(row$Rank == 2, "🥈",
+                   ifelse(row$Rank == 3, "🥉", "  ")))
+    
+    # Format model type
+    type_label <- ifelse(!is.na(row$Type), 
+                        sprintf("(%s)", row$Type), 
+                        "(Baseline)")
+    
+    cat(sprintf("│ %s %2d. %-15s %-15s RMSE: %.4f  MAE: %.4f  %s\n",
+                emoji,
+                row$Rank,
+                row$Model,
+                type_label,
+                row$Test_RMSE,
+                row$Test_MAE,
+                row$Improvement_vs_Best_Baseline))
+  }
+  
+  cat("│\n")
+  
+  # Summary statistics
+  best_baseline <- river_data %>% 
+    filter(Model %in% c("Persistence", "Mean", "ARIMA")) %>%
+    slice_min(Test_RMSE, n = 1)
+  
+  best_ml <- river_data %>%
+    filter(Model %in% c("xGBoost", "LSTM")) %>%
+    slice_min(Test_RMSE, n = 1)
+  
+  if(nrow(best_ml) > 0) {
+    improvement <- (best_baseline$Test_RMSE - best_ml$Test_RMSE) / best_baseline$Test_RMSE * 100
+    
+    cat(sprintf("│ 📊 Best Baseline: %s (RMSE: %.4f)\n", 
+                best_baseline$Model, best_baseline$Test_RMSE))
+    cat(sprintf("│ 🤖 Best ML Model: %s (RMSE: %.4f)\n", 
+                best_ml$Model, best_ml$Test_RMSE))
+    cat(sprintf("│ 📈 ML Improvement: %.1f%%\n", improvement))
+  }
+  
+  cat("│\n")
+  cat("└────────────────────────────────────────────────────────────────────────┘\n\n")
+}
+
+## Binary Classification
+for(river in unique(all_compiled_results$classification$Dataset)) {
+  
+  river_class_data <- all_compiled_results$classification %>%
+    filter(Dataset == river) %>%
+    arrange(desc(F1_Score))
+  
+  cat(sprintf("┌─ %s %s\n", river, paste(rep("─", 60 - nchar(river)), collapse = "")))
+  cat("│\n")
+  
+  for(i in 1:nrow(river_class_data)) {
+    row <- river_class_data[i, ]
+    
+    emoji <- ifelse(i == 1, "🎯", "  ")
+    
+    cat(sprintf("│ %s %-10s  Accuracy: %.3f  Precision: %.3f  Recall: %.3f  F1: %.3f\n",
+                emoji,
+                row$Model,
+                row$Accuracy,
+                row$Precision,
+                row$Recall,
+                row$F1_Score))
+  }
+  
+  cat("│\n")
+  cat("└────────────────────────────────────────────────────────────────────────┘\n\n")
+}
+
+### Best Model Recommendation
+
+generate_recommendations <- function(river_name, regression_data, classification_data) {
+
+  # Get best models
+  best_reg <- regression_data %>%
+    filter(River == river_name, Model %in% c("xGBoost", "LSTM")) %>%
+    slice_min(Test_RMSE, n = 1)
+  
+  best_class <- classification_data %>%
+    filter(Dataset == river_name) %>%
+    slice_max(F1_Score, n = 1)
+  
+  best_overall <- regression_data %>%
+    filter(River == river_name, Model %in% c("xGBoost", "LSTM")) %>%
+    left_join(
+      classification_data %>% select(Dataset, Model, Accuracy, F1_Score),
+      by = c("River" = "Dataset", "Model" = "Model")
+    ) %>%
+    mutate(
+      RMSE_score = (max(Test_RMSE) - Test_RMSE) / (max(Test_RMSE) - min(Test_RMSE)),
+      Combined_Score = (RMSE_score + Accuracy) / 2
+    ) %>%
+    slice_max(Combined_Score, n = 1)
+  
+  cat(sprintf("┌─ %s %s\n", river_name, paste(rep("─", 60 - nchar(river_name)), collapse = "")))
+  cat("│\n")
+  
+  # Regression recommendation
+  cat(sprintf("│ 📐 BEST FOR REGRESSION (Continuous Predictions):\n"))
+  cat(sprintf("│    Model: %s\n", best_reg$Model))
+  cat(sprintf("│    Test RMSE: %.4f ft/yr\n", best_reg$Test_RMSE))
+  cat(sprintf("│    Test MAE:  %.4f ft/yr\n", best_reg$Test_MAE))
+  
+  # Calculate baseline improvement
+  best_baseline_rmse <- regression_data %>%
+    filter(River == river_name, Model %in% c("Persistence", "Mean", "ARIMA")) %>%
+    slice_min(Test_RMSE, n = 1) %>%
+    pull(Test_RMSE)
+  
+  improvement <- (best_baseline_rmse - best_reg$Test_RMSE) / best_baseline_rmse * 100
+  cat(sprintf("│    Improvement over best baseline: %.1f%%\n", improvement))
+  cat("│\n")
+  
+  # Classification recommendation
+  cat(sprintf("│ 🎯 BEST FOR CLASSIFICATION (Dredging Yes/No):\n"))
+  cat(sprintf("│    Model: %s\n", best_class$Model))
+  cat(sprintf("│    Accuracy:  %.3f\n", best_class$Accuracy))
+  cat(sprintf("│    Precision: %.3f (when predict YES, how often correct)\n", best_class$Precision))
+  cat(sprintf("│    Recall:    %.3f (of actual YES, how many caught)\n", best_class$Recall))
+  cat(sprintf("│    F1 Score:  %.3f (harmonic mean)\n", best_class$F1_Score))
+  cat("│\n")
+  
+  # Overall recommendation
+  cat(sprintf("│ ⭐ RECOMMENDED MODEL (Balanced Performance):\n"))
+  cat(sprintf("│    Model: %s\n", best_overall$Model))
+  cat(sprintf("│    RMSE: %.4f  |  Accuracy: %.3f  |  F1: %.3f\n",
+              best_overall$Test_RMSE, best_overall$Accuracy, best_overall$F1_Score))
+  cat("│\n")
+  
+  # Operational guidance
+  cat("│ 💼 OPERATIONAL GUIDANCE:\n")
+  
+  if(best_overall$Model == "xGBoost") {
+    cat("│    ✓ xGBoost selected: Fast inference, interpretable features\n")
+    cat("│    ✓ Best for: Real-time predictions, operational deployment\n")
+    cat("│    ✓ Use when: Need quick decisions with feature importance\n")
+    cat("│    ⚠ Note: May miss long-term temporal patterns\n")
+  } else if(best_overall$Model == "LSTM") {
+    cat("│    ✓ LSTM selected: Captures complex temporal patterns\n")
+    cat("│    ✓ Best for: Multi-step forecasts, long-range planning\n")
+    cat("│    ✓ Use when: Planning dredging 30-45 days ahead\n")
+    cat("│    ⚠ Note: Higher computational cost, less interpretable\n")
+  }
+  
+  cat("│\n")
+  cat("└────────────────────────────────────────────────────────────────────────┘\n\n")
+}
+
+# Generate recommendations for each river
+generate_recommendations("Illinois Waterway", 
+                        all_compiled_results$regression,
+                        all_compiled_results$classification)
+
+generate_recommendations("Mississippi River",
+                        all_compiled_results$regression,
+                        all_compiled_results$classification)
+
+generate_recommendations("Combined",
+                        all_compiled_results$regression,
+                        all_compiled_results$classification)
+
+```
+
+
+### Model Selection Summary Table 
+```{r}
+summary_table <- all_compiled_results$regression %>%
+  filter(Model %in% c("xGBoost", "LSTM")) %>%
+  left_join(
+    all_compiled_results$classification %>%
+      select(Dataset, Model, Accuracy, F1_Score),
+    by = c("River" = "Dataset", "Model" = "Model")
+  ) %>%
+  group_by(River) %>%
+  mutate(
+    Best_RMSE = ifelse(Test_RMSE == min(Test_RMSE), "✓", ""),
+    Best_Accuracy = ifelse(Accuracy == max(Accuracy, na.rm = TRUE), "✓", "")
+  ) %>%
+  ungroup() %>%
+  select(River, Model, Test_RMSE, Best_RMSE, Accuracy, Best_Accuracy, F1_Score)
+
+print(summary_table)
+
+cat("\n")
+cat("Legend:\n")
+cat("  ✓ = Best performer in that category\n")
+cat("  RMSE = Root Mean Squared Error (lower is better)\n")
+cat("  Accuracy = Classification accuracy (higher is better)\n")
+cat("  F1 = F1 Score for binary classification (higher is better)\n\n")
+
+
+### Save Results 
+cat("📁 Saving results to files...\n\n")
+
+# Save comprehensive results
+write_csv(all_compiled_results$regression, "./Final_Comparison/Final_Regression_Results.csv")
+write_csv(all_compiled_results$classification, "./Final_Comparison/Final_Classification_Results.csv")
+
+# Create recommendation document
+recommendations_df <- all_compiled_results$regression %>%
+  filter(Model %in% c("xGBoost", "LSTM")) %>%
+  left_join(
+    all_compiled_results$classification %>%
+      select(Dataset, Model, Accuracy, Precision, Recall, F1_Score),
+    by = c("River" = "Dataset", "Model" = "Model")
+  ) %>%
+  group_by(River) %>%
+  mutate(
+    RMSE_Rank = rank(Test_RMSE),
+    Accuracy_Rank = rank(desc(Accuracy)),
+    Overall_Rank = RMSE_Rank + Accuracy_Rank,
+    Recommended = ifelse(Overall_Rank == min(Overall_Rank), "YES", "NO")
+  ) %>%
+  ungroup() %>%
+  select(River, Model, Recommended, Test_RMSE, Test_MAE, 
+         Accuracy, Precision, Recall, F1_Score) %>%
+  arrange(River, desc(Recommended))
+
+write_csv(recommendations_df, "./Final_Comparison/Model_Recommendations_By_River.csv")
+
+
+
+```
+
+
+### Wrap it up
+```{r}
+# Calculate overall statistics
+total_models <- nrow(all_compiled_results$regression)
+total_ml_models <- sum(all_compiled_results$regression$Model %in% c("xGBoost", "LSTM"))
+total_baselines <- total_models - total_ml_models
+
+cat(sprintf("Total Models Evaluated: %d\n", total_models))
+cat(sprintf("  ├─ Baseline Models: %d\n", total_baselines))
+cat(sprintf("  └─ ML Models: %d\n", total_ml_models))
+cat("\n")
+
+# Best overall performance
+best_overall <- all_compiled_results$regression %>%
+  filter(Model %in% c("xGBoost", "LSTM")) %>%
+  slice_min(Test_RMSE, n = 1)
+
+cat("🏆 OVERALL BEST PERFORMER:\n")
+cat(sprintf("   Model: %s\n", best_overall$Model))
+cat(sprintf("   River: %s\n", best_overall$River))
+cat(sprintf("   RMSE: %.4f ft/yr\n", best_overall$Test_RMSE))
+cat(sprintf("   MAE:  %.4f ft/yr\n\n", best_overall$Test_MAE))
+
+# Average improvements
+avg_improvement <- all_compiled_results$regression %>%
+  filter(Model %in% c("xGBoost", "LSTM")) %>%
+  group_by(River) %>%
+  summarise(
+    Best_ML_RMSE = min(Test_RMSE),
+    Best_Baseline_RMSE = min(Test_RMSE[Model %in% c("Persistence", "Mean", "ARIMA")], 
+                             na.rm = TRUE)
+  ) %>%
+  mutate(Improvement = (Best_Baseline_RMSE - Best_ML_RMSE) / Best_Baseline_RMSE * 100)
+
+cat("📈 AVERAGE IMPROVEMENTS:\n")
+cat(sprintf("   Illinois Waterway: %.1f%% improvement over baseline\n", 
+            avg_improvement$Improvement[avg_improvement$River == "Illinois Waterway"]))
+cat(sprintf("   Mississippi River: %.1f%% improvement over baseline\n",
+            avg_improvement$Improvement[avg_improvement$River == "Mississippi River"]))
+cat(sprintf("   Combined: %.1f%% improvement over baseline\n\n",
+            avg_improvement$Improvement[avg_improvement$River == "Combined"]))
+
+# Classification performance summary
+avg_classification <- all_compiled_results$classification %>%
+  summarise(
+    Avg_Accuracy = mean(Accuracy, na.rm = TRUE),
+    Avg_Precision = mean(Precision, na.rm = TRUE),
+    Avg_Recall = mean(Recall, na.rm = TRUE),
+    Avg_F1 = mean(F1_Score, na.rm = TRUE)
+  )
+
+cat("🎯 AVERAGE CLASSIFICATION PERFORMANCE:\n")
+cat(sprintf("   Accuracy:  %.3f\n", avg_classification$Avg_Accuracy))
+cat(sprintf("   Precision: %.3f\n", avg_classification$Avg_Precision))
+cat(sprintf("   Recall:    %.3f\n", avg_classification$Avg_Recall))
+cat(sprintf("   F1 Score:  %.3f\n\n", avg_classification$Avg_F1))
+
+
+cat("🎓 CAPSTONE REPORT RECOMMENDATIONS:\n\n")
+
+cat("1️⃣  Present the progression: Baselines → xGBoost → LSTM\n")
+cat("    This shows increasing model complexity is justified by performance gains\n\n")
+
+cat("2️⃣  Highlight river-specific patterns:\n")
+for(river in unique(recommendations_df$River)) {
+  best_model <- recommendations_df %>%
+    filter(River == river, Recommended == "YES") %>%
+    pull(Model)
+  cat(sprintf("    • %s: Use %s for optimal performance\n", river, best_model))
+}
+cat("\n")
+
+cat("3️⃣  Discuss operational implications:\n")
+cat("    • False negatives (missed dredging) = operational risk\n")
+cat("    • False positives (unnecessary dredging) = cost inefficiency\n")
+cat("    • Use precision/recall to balance these trade-offs\n\n")
+
+cat("4️⃣  Address limitations:\n")
+cat("    • Survey frequency differences (IWW vs Mississippi)\n")
+cat("    • Temporal gaps in data\n")
+cat("    • Pool-level vs reach-level predictions\n\n")
+
+cat("5️⃣  Future work suggestions:\n")
+cat("    • Real-time deployment testing\n")
+cat("    • Integration with existing dredge scheduling\n")
+cat("    • Spatial modeling (CNN like ARA paper)\n")
+cat("    • Ensemble methods combining xGBoost + LSTM\n\n")
+
+cat("📊 Your results are ready for:\n")
+cat("   ✓ Capstone presentation\n")
+cat("   ✓ Final report\n")
+cat("   ✓ Stakeholder communication\n")
+cat("   ✓ Operational deployment planning\n\n")
+```
+

@@ -1,0 +1,50 @@
+---
+title: "SupportScripts"
+output: html_document
+---
+
+
+###Load in CSAT Data
+```{r, evaluate = FALSE, include=FALSE}
+### Shoaling Rates
+
+files <-list.files(path = csat_path,
+                                 pattern = "_SurveyPairVolumeDifference\\.csv$",
+                                 full.names = TRUE)
+
+read_and_label2 <- function(file_path) {
+  # Extract filename
+  file_name <- basename(file_path)
+  
+  # Remove extension
+  file_name_no_ext <- tools::file_path_sans_ext(file_name)
+  
+  # Split by underscore
+  parts <- str_split(file_name_no_ext, "_", simplify = TRUE)
+  
+  # Extract relevant parts
+  river <- parts[1]
+  pool <- parts[2]
+  reach <- parts[4]  # MVR is at [3], 14 or 22 is at [4]
+  
+  # Read the data
+  data <- read_csv(file_path, show_col_types = FALSE)
+  
+  # Add new columns
+  data <- data %>%
+    mutate(
+      river = river,
+      pool = pool,
+      reach = reach,
+      source_file = file_name
+    )
+  
+  return(data)
+}
+
+# Apply the function to all files and bind into one big dataframe
+CSAT_data <- map_dfr(files, read_and_label2)
+write_csv(CSAT_data, "CSAT_Data_Combined.csv")
+```
+```
+
